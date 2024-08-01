@@ -3,7 +3,7 @@ module github.com/ChronosMasterOfAllTime/gorm-snowflake
 go 1.22
 
 require (
-	github.com/snowflakedb/gosnowflake v1.10.1
+	github.com/snowflakedb/gosnowflake v1.11.0
 	gorm.io/gorm v1.25.9
 )
 
