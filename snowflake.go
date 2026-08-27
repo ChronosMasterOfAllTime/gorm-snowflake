@@ -39,6 +39,22 @@ type Config struct {
 	MaxOpenConns    int
 	MaxIdleConns    int
 	ConnMaxLifetime int // in seconds
+	// DisableCreateReadBack turns off the post-INSERT read-back that populates
+	// fields Snowflake generates (auto-increment keys, `default:` tags). That
+	// read-back issues a CHANGES(...) query against the table, which requires
+	// CHANGE_TRACKING to be enabled on it. Tables created outside this driver's
+	// migrator do not have it, and the read-back fails there. The driver already
+	// skips the read-back when no field actually needs one, so this is an escape
+	// hatch rather than the usual remedy.
+	//
+	// Set it when the generated values are genuinely not needed, including when
+	// running against a connection pool that is not the Snowflake driver and so
+	// cannot report a query id. Without it, a create that cannot populate a
+	// DB-generated field fails with ErrCreateReadBack rather than leaving a zero
+	// behind: the insert is committed either way, and a silent zero is far harder
+	// to notice than an error.
+	// Default: false (maintains backward compatibility)
+	DisableCreateReadBack bool
 	// UseUnionSelect enables UNION ALL SELECT syntax for INSERT statements
 	// Required for using SQL functions in values, but slower than VALUES syntax
 	// Default: true (maintains backward compatibility)
@@ -288,6 +304,15 @@ func (sns NamingStrategy) CheckerName(table, column string) string {
 // IndexName snowflake edition
 func (sns NamingStrategy) IndexName(table, column string) string {
 	return sns.defaultNS.IndexName(table, column)
+}
+
+// isChangeTrackingError reports whether err is Snowflake refusing a CHANGES query
+// because change tracking is unavailable on the table. Matched on message text: the
+// server's numeric codes are not enumerated by gosnowflake, so there is no constant
+// to compare against. Used only to choose a diagnostic hint.
+func isChangeTrackingError(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "change tracking") || strings.Contains(msg, "change_tracking")
 }
 
 // Translate implements the ErrorTranslator interface to convert Snowflake-specific
