@@ -1,6 +1,9 @@
 package snowflake
 
 import (
+	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -9,6 +12,7 @@ import (
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+	"gorm.io/gorm/logger"
 	"gorm.io/gorm/schema"
 )
 
@@ -1126,4 +1130,328 @@ func TestMergeCreateConditionalUpdate(t *testing.T) {
 			t.Errorf("did not expect a condition without Where, got: %s", sql)
 		}
 	})
+}
+
+// readBackCapturePool records the queries issued after an insert so tests can
+// assert whether the CHANGES(...) read-back was emitted.
+type readBackCapturePool struct {
+	mockConnPool
+	queries       []string
+	lastQueryArgs []interface{}
+}
+
+func (p *readBackCapturePool) QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error) {
+	p.queries = append(p.queries, query)
+	p.lastQueryArgs = args
+	return nil, fmt.Errorf("no rows for test")
+}
+
+func (p *readBackCapturePool) readBackQueries() []string {
+	var out []string
+	for _, q := range p.queries {
+		if strings.Contains(q, "CHANGES(INFORMATION => APPEND_ONLY)") {
+			out = append(out, q)
+		}
+	}
+	return out
+}
+
+func newReadBackDB(t *testing.T, pool gorm.ConnPool, disableReadBack bool) *gorm.DB {
+	t.Helper()
+	// Stand in for Snowflake reporting a query id, which the mock pool cannot do:
+	// gosnowflake's context key is unexported, so the channel is unreachable from here.
+	stubQueryID(t, "01b2c3d4-0000-1234-0000-abcdef012345")
+	dialector := &Dialector{Config: &Config{
+		Conn:                  pool,
+		DriverName:            "snowflake",
+		UseUnionSelect:        true,
+		QuoteFields:           true,
+		DisableCreateReadBack: disableReadBack,
+	}}
+	db, err := gorm.Open(dialector, &gorm.Config{
+		Logger:                 logger.Default.LogMode(logger.Silent),
+		SkipDefaultTransaction: true,
+	})
+	if err != nil {
+		t.Fatalf("failed to open db: %v", err)
+	}
+	return db
+}
+
+// stubQueryID makes queryIDCapture yield id for the duration of the test.
+func stubQueryID(t *testing.T, id string) {
+	t.Helper()
+	previous := queryIDCapture
+	queryIDCapture = func(ctx context.Context) (context.Context, func() string) {
+		return ctx, func() string { return id }
+	}
+	t.Cleanup(func() { queryIDCapture = previous })
+}
+
+// ReadBackModel has a DB-generated field, which is what triggers the read-back.
+type ReadBackModel struct {
+	ID   uint `gorm:"primaryKey;autoIncrement"`
+	Name string
+}
+
+func TestShouldReadBackDefaults(t *testing.T) {
+	t.Run("Default behavior - enabled", func(t *testing.T) {
+		if !shouldReadBackDefaults(setupMockDB(t)) {
+			t.Error("Expected read-back to be enabled by default")
+		}
+	})
+
+	t.Run("Disabled via config", func(t *testing.T) {
+		db := newReadBackDB(t, &readBackCapturePool{}, true)
+		if shouldReadBackDefaults(db) {
+			t.Error("Expected read-back to be disabled when DisableCreateReadBack is set")
+		}
+	})
+
+	t.Run("Non-Snowflake dialector", func(t *testing.T) {
+		mockDB, _ := gorm.Open(&mockDialector{}, &gorm.Config{})
+		if !shouldReadBackDefaults(mockDB) {
+			t.Error("Expected read-back to be enabled for non-Snowflake dialector")
+		}
+	})
+}
+
+func TestCreateReadBack(t *testing.T) {
+	t.Run("emits the CHANGES query by default", func(t *testing.T) {
+		pool := &readBackCapturePool{}
+		db := newReadBackDB(t, pool, false)
+
+		err := db.Create(&ReadBackModel{Name: "x"}).Error
+		if err == nil {
+			t.Fatal("expected the read-back failure to surface")
+		}
+		if !errors.Is(err, ErrCreateReadBack) {
+			t.Errorf("expected error wrapping ErrCreateReadBack, got: %v", err)
+		}
+		if got := pool.readBackQueries(); len(got) != 1 {
+			t.Errorf("expected exactly one read-back query, got %d: %v", len(got), pool.queries)
+		}
+	})
+
+	t.Run("skips the CHANGES query when disabled", func(t *testing.T) {
+		pool := &readBackCapturePool{}
+		db := newReadBackDB(t, pool, true)
+
+		if err := db.Create(&ReadBackModel{Name: "x"}).Error; err != nil {
+			t.Fatalf("expected create to succeed, got: %v", err)
+		}
+		if got := pool.readBackQueries(); len(got) != 0 {
+			t.Errorf("expected no read-back query, got: %v", got)
+		}
+	})
+
+	t.Run("batch creates take the same read-back path as single rows", func(t *testing.T) {
+		pool := &readBackCapturePool{}
+		db := newReadBackDB(t, pool, false)
+
+		err := db.Create(&[]ReadBackModel{{Name: "a"}, {Name: "b"}}).Error
+		if err == nil {
+			t.Fatal("expected the read-back failure to surface for a slice create too")
+		}
+		if !errors.Is(err, ErrCreateReadBack) {
+			t.Errorf("expected error wrapping ErrCreateReadBack, got: %v", err)
+		}
+		if got := pool.readBackQueries(); len(got) != 1 {
+			t.Errorf("expected exactly one read-back query, got %d: %v", len(got), pool.queries)
+		}
+	})
+
+	t.Run("underlying driver error stays reachable", func(t *testing.T) {
+		pool := &readBackCapturePool{}
+		db := newReadBackDB(t, pool, false)
+
+		err := db.Create(&ReadBackModel{Name: "x"}).Error
+		if err == nil {
+			t.Fatal("expected an error")
+		}
+		if !strings.Contains(err.Error(), "no rows for test") {
+			t.Errorf("expected the underlying error to be preserved, got: %v", err)
+		}
+	})
+}
+
+// TestCreateReadBackDetection covers the automatic detection that decides whether a
+// read-back is needed at all, without any configuration.
+func TestCreateReadBackDetection(t *testing.T) {
+	t.Run("skipped when the caller supplied the generated value", func(t *testing.T) {
+		pool := &readBackCapturePool{}
+		db := newReadBackDB(t, pool, false)
+
+		// This is the shape that broke in production: GORM inferred ID as an
+		// auto-increment primary key, but the application supplies it.
+		if err := db.Create(&ReadBackModel{ID: 98473, Name: "x"}).Error; err != nil {
+			t.Fatalf("expected create to succeed, got: %v", err)
+		}
+		if got := pool.readBackQueries(); len(got) != 0 {
+			t.Errorf("expected no read-back query when the value was supplied, got: %v", got)
+		}
+	})
+
+	t.Run("skipped when every row of a slice supplied the value", func(t *testing.T) {
+		pool := &readBackCapturePool{}
+		db := newReadBackDB(t, pool, false)
+
+		rows := []ReadBackModel{{ID: 1, Name: "a"}, {ID: 2, Name: "b"}}
+		if err := db.Create(&rows).Error; err != nil {
+			t.Fatalf("expected create to succeed, got: %v", err)
+		}
+		if got := pool.readBackQueries(); len(got) != 0 {
+			t.Errorf("expected no read-back query, got: %v", got)
+		}
+	})
+
+	t.Run("still runs when one row of a slice omits the value", func(t *testing.T) {
+		pool := &readBackCapturePool{}
+		db := newReadBackDB(t, pool, false)
+
+		rows := []ReadBackModel{{ID: 1, Name: "a"}, {Name: "b"}}
+		if err := db.Create(&rows).Error; !errors.Is(err, ErrCreateReadBack) {
+			t.Fatalf("expected a read-back attempt, got: %v", err)
+		}
+		if got := pool.readBackQueries(); len(got) != 1 {
+			t.Errorf("expected one read-back query, got %d: %v", len(got), pool.queries)
+		}
+	})
+
+	t.Run("selects only the fields that are actually unset", func(t *testing.T) {
+		pool := &readBackCapturePool{}
+		db := newReadBackDB(t, pool, false)
+
+		// CreatedAt is supplied, ID is not, so only ID should be requested.
+		err := db.Create(&PartialDefaultsModel{CreatedAt: time.Now()}).Error
+		if !errors.Is(err, ErrCreateReadBack) {
+			t.Fatalf("expected a read-back attempt, got: %v", err)
+		}
+		got := pool.readBackQueries()
+		if len(got) != 1 {
+			t.Fatalf("expected one read-back query, got %d: %v", len(got), pool.queries)
+		}
+		if strings.Contains(got[0], "created_at") {
+			t.Errorf("did not expect the supplied created_at to be read back, got: %s", got[0])
+		}
+		if !strings.Contains(got[0], "id") {
+			t.Errorf("expected the unset id to be read back, got: %s", got[0])
+		}
+	})
+}
+
+// PartialDefaultsModel has two DB-generated fields so tests can supply one and omit
+// the other.
+type PartialDefaultsModel struct {
+	ID        uint `gorm:"primaryKey;autoIncrement"`
+	Name      string
+	CreatedAt time.Time `gorm:"autoCreateTime"`
+}
+
+func TestReadBackQueryShape(t *testing.T) {
+	const queryID = "01b2c3d4-0000-1234-0000-abcdef012345"
+
+	pool := &readBackCapturePool{}
+	db := newReadBackDB(t, pool, false)
+	stubQueryID(t, queryID)
+
+	if err := db.Create(&ReadBackModel{Name: "x"}).Error; !errors.Is(err, ErrCreateReadBack) {
+		t.Fatalf("expected a read-back attempt, got: %v", err)
+	}
+	got := pool.readBackQueries()
+	if len(got) != 1 {
+		t.Fatalf("expected one read-back query, got %d: %v", len(got), pool.queries)
+	}
+
+	// Snowflake requires a constant expression in the version specifier. A function
+	// call there is rejected outright, which is what LAST_QUERY_ID() was.
+	if strings.Contains(got[0], "LAST_QUERY_ID") {
+		t.Errorf("expected no LAST_QUERY_ID() call, got: %s", got[0])
+	}
+	if !strings.Contains(got[0], "BEFORE(statement=>'"+queryID+"')") {
+		t.Errorf("expected the query id inlined as a literal, got: %s", got[0])
+	}
+	// The read-back has no placeholders, so it must carry no bind variables.
+	if len(pool.lastQueryArgs) != 0 {
+		t.Errorf("expected no bind variables on the read-back, got: %v", pool.lastQueryArgs)
+	}
+}
+
+func TestReadBackErrorsWithoutQueryID(t *testing.T) {
+	for _, id := range []string{"", "not a query id", "x'; DROP TABLE t; --", strings.Repeat("a", 65)} {
+		t.Run(fmt.Sprintf("id=%q", id), func(t *testing.T) {
+			pool := &readBackCapturePool{}
+			db := newReadBackDB(t, pool, false)
+			stubQueryID(t, id)
+
+			// The insert is committed but the generated fields cannot be fetched. Staying
+			// quiet here would hand back a struct with a plausible-looking zero id, so this
+			// has to surface rather than warn.
+			model := &ReadBackModel{Name: "x"}
+			err := db.Create(model).Error
+			if !errors.Is(err, ErrCreateReadBack) {
+				t.Fatalf("expected ErrCreateReadBack, got: %v", err)
+			}
+			if model.ID != 0 {
+				t.Errorf("expected id to stay zero, got: %d", model.ID)
+			}
+			if got := pool.readBackQueries(); len(got) != 0 {
+				t.Errorf("expected no read-back query, got: %v", got)
+			}
+		})
+	}
+
+	t.Run("DisableCreateReadBack opts out of the error", func(t *testing.T) {
+		pool := &readBackCapturePool{}
+		db := newReadBackDB(t, pool, true)
+		stubQueryID(t, "")
+
+		// Callers that genuinely do not need the generated values say so explicitly,
+		// which is what makes erroring by default safe.
+		if err := db.Create(&ReadBackModel{Name: "x"}).Error; err != nil {
+			t.Fatalf("expected create to succeed, got: %v", err)
+		}
+		if got := pool.readBackQueries(); len(got) != 0 {
+			t.Errorf("expected no read-back query, got: %v", got)
+		}
+	})
+}
+
+func TestValidQueryID(t *testing.T) {
+	tests := []struct {
+		id   string
+		want bool
+	}{
+		{"01b2c3d4-0000-1234-0000-abcdef012345", true},
+		{"abc_DEF-123", true},
+		{"", false},
+		{"has space", false},
+		{"quote'injection", false},
+		{"semi;colon", false},
+		{strings.Repeat("a", 65), false},
+	}
+	for _, tt := range tests {
+		if got := validQueryID(tt.id); got != tt.want {
+			t.Errorf("validQueryID(%q) = %v, want %v", tt.id, got, tt.want)
+		}
+	}
+}
+
+func TestIsChangeTrackingError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"message text", errors.New("Change tracking is not enabled on table T"), true},
+		{"table option wording", errors.New("091930: CHANGE_TRACKING is not enabled"), true},
+		{"unrelated error", errors.New("connection reset"), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isChangeTrackingError(tt.err); got != tt.want {
+				t.Errorf("isChangeTrackingError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
 }
